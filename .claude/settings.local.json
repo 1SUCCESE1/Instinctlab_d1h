@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/you/IsaacLab/source/isaaclab/isaaclab/sensors/ray_caster/patterns/**)",
+      "Bash(python3 -c \"import instinct_rl; print\\(instinct_rl.__file__\\)\")",
+      "Bash(find / -path \"*instinct_rl*runner*.py\" -not -path \"*/node_modules/*\")",
+      "Bash(grep -n \"critic\\\\|observations\\\\[\\\\|obs_segments\\\\|get_obs_segments\\\\|priv\\\\|scanner\" /home/you/instinct_rl/instinct_rl/runners/on_policy_runner.py | head -30)",
+      "Read(//home/you/instinct_rl/instinct_rl/runners/**)"
+    ]
+  }
+}
