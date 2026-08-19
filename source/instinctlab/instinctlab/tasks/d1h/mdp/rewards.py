@@ -338,19 +338,32 @@ def lin_vel_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     return reward
 
 
-def ang_vel_x_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def ang_vel_x_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str | None = None,
+    lateral_release: float = 0.5,
+) -> torch.Tensor:
     """Penalize x-axis (roll) base angular velocity using L2 squared kernel.
 
-    NO command gate. Run 20260810_155717 gated this term on the lateral command and
-    the policy stopped learning to stand at all (upward collapsed 3.6 -> 1.9, i.e.
-    lying down): during early training lateral commands are active most of the time,
-    so the gate released the roll damping exactly when the policy needed it to learn
-    to balance. The penalty is on roll ANGULAR VELOCITY, a dynamic quantity — it
-    damps continuous rolling/shake, not the brief lean used during a strafe step,
-    so it does not block side-stepping.
+    Gated on the lateral command: side-stepping REQUIRES the torso to lean into the
+    roll axis (shifting the COM sideways), so roll velocity during a strafe is
+    legitimate and should not be penalised as hard. With ``command_name`` set, the
+    penalty applies at full strength when there is no lateral command (standing /
+    driving forward) and is scaled to ``lateral_release`` while strafing.
+
+    Note: keep ``lateral_release`` > 0 (NOT 0). Run 20260810_155717 set the gate to
+    fully release roll during strafing and the policy stopped learning to stand
+    (upward collapsed) because early training spends most time under lateral
+    commands. A partial release (0.5) keeps enough roll damping to learn balance
+    while allowing the strafe lean.
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     reward = torch.square(asset.data.root_ang_vel_b[:, 0])
+    if command_name is not None:
+        cmd_y = env.command_manager.get_command(command_name)[:, 1]
+        y_gate = torch.sigmoid((torch.abs(cmd_y) - 0.05) / 0.02)
+        reward = reward * (1.0 - y_gate * (1.0 - lateral_release))
     reward *= torch.clamp(-asset.data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
@@ -408,22 +421,41 @@ def reward_feet_air_time(
     command_name: str = "base_velocity",
     min_air_t: float = 0.5,
     force_threshold: float = 1.0,
+    lateral_only: bool = False,
 ) -> torch.Tensor:
-    """Reward airborne feet (taken steps) when a velocity command is active."""
+    """Reward airborne feet (taken steps) when a velocity command is active.
+
+    Uses ``last_air_time`` (the duration of the most recent airborne phase, recorded
+    on landing) rather than ``current_air_time``. For a WHEELED robot the wheel
+    keeps tangential (x/y) contact force while rolling, so the sensor's internal
+    ``is_contact`` (norm of all 3 force axes) stays True even when the leg is lifted
+    and ``current_air_time`` is reset to 0 every frame — the reward would be 0 even
+    though the leg did lift. ``last_air_time`` captures the air time at the moment
+    the foot re-contacts, which is exactly the lift duration of the step.
+
+    With ``lateral_only=True`` the reward is gated on the LATERAL (y) command only —
+    standing/forward motion earns no air-time reward. This keeps the robot from
+    idle-stepping in place while standing (the wheels should stay planted except
+    when side-stepping).
+    """
     contact_sensor = env.scene[sensor_cfg.name]
-    contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > force_threshold
-    # v2.x compat: use current_air_time (v2.3) instead of air_time (v3.0+)
-    air_time = getattr(contact_sensor.data, "air_time", None)
+    air_time = getattr(contact_sensor.data, "last_air_time", None)
     if air_time is None:
         air_time = contact_sensor.data.current_air_time
     air_time = air_time[:, sensor_cfg.body_ids]
 
-    landed = contact & (air_time > min_air_t)
-    rew_airTime = torch.sum(landed.float(), dim=-1)
+    # reward a foot that just landed after being airborne for at least min_air_t
+    landed = (air_time > min_air_t).float()
+    rew_airTime = torch.sum(landed, dim=-1)
 
     cmd = env.command_manager.get_command(command_name)
-    moving_mask = torch.norm(cmd[:, :2], dim=1) > 0.1
-    rew_airTime *= moving_mask
+    if lateral_only:
+        # gate on |cmd_y| only (side-stepping); standing/forward earns nothing
+        lateral_mask = torch.abs(cmd[:, 1]) > 0.1
+        rew_airTime *= lateral_mask.float()
+    else:
+        moving_mask = torch.norm(cmd[:, :2], dim=1) > 0.1
+        rew_airTime *= moving_mask
 
     return rew_airTime
 
@@ -456,24 +488,15 @@ def leg_activity(
     lean_gain: float = 0.10,
     vel_penalty_gain: float = 0.0,
 ) -> torch.Tensor:
-    """Reward the feet being under the center of mass (legs follow wheel roll).
+    """Reward forward/backward leg swing when a velocity command is active.
 
-    Control architecture: the wheels high-frequency hold the torso level AND
-    produce the fore/aft translation; the legs LOW-FREQUENCY move the wheels to
-    keep them under the COM (the wheel is the inverted-pendulum pivot — the COM
-    must stay above/behind the contact point, so as the robot rolls forward the
-    legs swing the wheels forward to stay under the COM).
-
-    Reward is maximized when the MEAN foot x-offset (mean over BOTH feet) matches
-    the COM x-offset from the body, i.e. the feet sit directly under the center of
-    mass:
-        feet_x_body ≈ com_x_body
-    Using the MEAN offset keeps the two legs moving together in x: a staggered
-    stance (one foot ahead, one behind) cancels in the mean and earns nothing.
-
-    The command still gates the reward (no leg positioning demanded while
-    standing still), but the TARGET is physical (COM) not heuristic, so the legs
-    automatically follow however far the wheels have rolled.
+    Encourages the legs to swing the feet ahead/behind the COM (pure
+    fore-aft motion) to generate drive, rather than bobbing up/down (which
+    changes the base height). Reward is maximized when the foot x-offset
+    from the body matches the commanded lean direction:
+        cmd>0 (forward)  -> feet swung backward (x offset matches -lean_gain*cmd)
+        cmd<0 (reverse)  -> feet swung forward
+    Gated on the command so standing still does not reward leg motion.
 
     ``vel_penalty_gain`` > 0 subtracts a penalty proportional to the leg joint
     velocities, so fast swinging erodes the reward — the policy learns to move
@@ -490,34 +513,77 @@ def leg_activity(
     base_quat_w_expanded = base_quat_w.unsqueeze(1).expand(-1, n_feet, -1).reshape(-1, 4)
     rel_w_flat = rel_w.reshape(-1, 3)
     rel_b = quat_apply_inverse(base_quat_w_expanded, rel_w_flat).reshape(n_envs, n_feet, 3)
-    feet_x_body = torch.mean(rel_b[:, :, 0], dim=1)
+    x_mean = torch.mean(rel_b[:, :, 0], dim=1)
 
-    # COM offset from body in body frame (x component)
-    com_pos_w = asset.data.root_com_pose_w[:, :3]
-    com_rel_w = com_pos_w - base_pos_w.squeeze(1)
-    com_x_body = quat_apply_inverse(base_quat_w, com_rel_w)[:, 0]
+    cmd = env.command_manager.get_command(command_name)
+    cmd_x = cmd[:, 0]
+    desired = -lean_gain * cmd_x
+    err = torch.abs(x_mean - desired)
 
-    # target: feet directly under the COM
-    err = torch.abs(feet_x_body - com_x_body)
-
-    # ALWAYS active, including standing still (no command gate): keeping the feet
-    # under the COM is the basic balance requirement, so the legs must position
-    # themselves to hold the wheels under the COM whether moving or stationary.
-    # Deploy feedback: with the moving gate, standing still left the legs passive
-    # and the torso wobbled fore/aft by pitching. Removing the gate makes the legs
-    # participate in static balance too.
-    # sigma 0.02: tight reward, feet must sit within ±2cm of the COM projection.
-    reward = torch.exp(-err / 0.02)
+    cmd_mag = torch.linalg.norm(cmd[:, :3], dim=1)
+    moving_gate = torch.sigmoid((cmd_mag - command_threshold) / 0.05)
+    reward = moving_gate * torch.exp(-err / 0.05)
 
     if vel_penalty_gain > 0.0:
         leg_ids = asset_cfg.joint_ids
         if leg_ids is None:
-            # default: all leg joints (hip/thigh/calf), keep wheels out
-            leg_ids = [
-                i for i, name in enumerate(asset.joint_names) if "_foot_joint" not in name
-            ]
+            leg_ids = [i for i, name in enumerate(asset.joint_names) if "_foot_joint" not in name]
         vel = asset.data.joint_vel[:, leg_ids]
         reward = reward - vel_penalty_gain * torch.mean(torch.square(vel), dim=1)
+    return reward
+
+
+def wheel_torque_balance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=[".*_foot_joint"]),
+) -> torch.Tensor:
+    """Reward the wheel torque cancelling the gravity (overturning) torque.
+
+    Core balance principle: the robot balances when the wheel torque equals the
+    gravity torque about the wheel contact. For an inverted pendulum the gravity
+    torque is
+        tau_grav = m_total * g * (com_x_w - wheel_x_w)
+    where (com_x_w - wheel_x_w) is the horizontal COM offset from the wheel
+    contact. The wheel actuator produces its own torque (applied_torque). When
+    they cancel the torso stays level.
+
+    Reward = exp(-|tau_wheel - tau_grav| / sigma): directly teaches the policy
+    to make the wheel output exactly the overturning torque — no reliance on the
+    indirect speed-tracking signal. ``asset_cfg`` selects the wheel joints.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.data.applied_torque.device
+    wheel_ids = asset_cfg.joint_ids
+    if wheel_ids is None:
+        wheel_ids = [
+            i for i, name in enumerate(asset.joint_names) if "_foot_joint" in name
+        ]
+
+    # total robot mass (sum over link default masses)
+    m_total = asset.data.default_mass.sum(dim=-1).to(device)  # (B,)
+
+    # horizontal COM offset from the wheel contact (world x)
+    foot_body_names = ["FL_foot", "FR_foot"]
+    foot_ids = [asset.body_names.index(name) for name in foot_body_names]
+    wheel_x_w = asset.data.body_pos_w[:, foot_ids, 0].to(device)  # (B, 2)
+    wheel_x_mean = torch.mean(wheel_x_w, dim=1)
+    com_x_w = asset.data.root_com_pose_w[:, 0].to(device)
+    d = com_x_w - wheel_x_mean  # (B,)
+
+    g = torch.tensor(9.81, device=device, dtype=m_total.dtype)
+    tau_grav = m_total * g * d  # (B,)
+
+    # actual wheel torque (sum of both wheels)
+    tau_wheel = asset.data.applied_torque[:, wheel_ids].sum(dim=-1).to(device)  # (B,)
+
+    # exp reward (weak helper), NOT a hard linear penalty. Run 170753 showed that
+    # -|dtau| at weight 3.0 dominated the budget (penalty ~-11), the policy could
+    # not satisfy exact torque matching under P control, and standing collapsed
+    # (upward 0.07, noise_std exploded to 6). exp keeps torque-matching as a soft
+    # bonus that rewards improvement near the target without punishing the policy
+    # into giving up when it cannot match exactly. Keep the weight small.
+    reward = torch.exp(-torch.abs(tau_wheel - tau_grav) / 2.0)
+    reward *= torch.clamp(-asset.data.projected_gravity_b[:, 2].to(device), 0, 0.7) / 0.7
     return reward
 
 
@@ -730,62 +796,24 @@ def lateral_leg_lift(
     env: ManagerBasedRLEnv,
     command_name: str,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=[".*_foot"]),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=[".*_foot"]),
     lift_threshold: float = 0.1,
     lift_height: float = 0.02,
     lateral_gain: float = 0.5,
-    min_y_shift: float = 0.03,
 ) -> torch.Tensor:
-    """Reward lateral foot DISPLACEMENT (sideways stepping) when a y-command is given.
+    """Reward foot lift during lateral velocity commands.
 
-    Sideways movement of a wheeled biped needs the legs to step sideways (hip
-    lateral swing), not just tilt the body. This rewards the foot's *lateral
-    displacement* in the body frame (foot y-offset from the body) aligned with
-    the commanded y direction, so the policy must actually move its feet
-    sideways rather than just lift them.
-
-    Reward is maximal when a foot is airborne (lifted) and displaced sideways
-    in the command direction:
-        reward = gate * sum over feet of (lifted * |foot_y_body - lateral_gain*cmd_y|)
-    where foot_y_body is the foot's y-offset from the body COM. When the foot
-    steps sideways (matching cmd_y), the offset grows and the reward increases;
-    merely lifting in place (no lateral displacement) gives little reward.
-
-    ``min_y_shift`` (default 0.03 m = 3 cm): only feet whose |y offset from the
-    body| EXCEEDS this minimum earn reward. This enforces a real sideways stride —
-    a foot that only twitches a couple mm sideways, or sits at the body center
-    while "lifting", earns nothing. Prevents fake micro-steps from gaming the term.
-
-    Uses the foot's position (not contact force) so the policy cannot game it by
-    momentarily unloading the wheel.
+    Detects lift via contact force: foot is airborne when net force z < 1N.
+    Much more reliable than z-height on rough terrain.
+    Gated on |cmd_y| so standing still does not reward leg motion.
     """
-    asset = env.scene[asset_cfg.name]
-    # foot position in body frame
-    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # (B, K, 3)
-    base_pos_w = asset.data.root_pos_w.unsqueeze(1)  # (B, 1, 3)
-    base_quat_w = asset.data.root_quat_w
-    rel_w = foot_pos_w - base_pos_w
-    n_envs, n_feet = rel_w.shape[:2]
-    base_quat_w_expanded = base_quat_w.unsqueeze(1).expand(-1, n_feet, -1).reshape(-1, 4)
-    rel_w_flat = rel_w.reshape(-1, 3)
-    rel_b = quat_apply_inverse(base_quat_w_expanded, rel_w_flat).reshape(n_envs, n_feet, 3)
-    foot_y_body = rel_b[:, :, 1]  # (B, K) lateral offset in body frame
-
-    # airborne detection by position (foot z above terrain)
-    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
-    ground_z = env.scene.env_origins[:, 2].unsqueeze(1)
-    airborne = (foot_z - ground_z > lift_height).float()  # (B, K)
-
+    contact_sensor = env.scene[sensor_cfg.name]
+    net_fz = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]  # (B, K)
+    airborne = (net_fz.abs() < 1.0).float()  # 1 where foot is off ground
+    lift = torch.sum(airborne, dim=1)  # count of airborne feet
     cmd = env.command_manager.get_command(command_name)
-    cmd_y = cmd[:, 1]
-    lateral_gate = torch.sigmoid((torch.abs(cmd_y) - lift_threshold) / 0.05)
-    # target foot y-offset aligned with commanded direction
-    target_y = lateral_gain * cmd_y  # (B,)
-    # reward airborne feet that are displaced sideways toward the target
-    lateral_match = torch.exp(-torch.square(foot_y_body - target_y.unsqueeze(1)) / 0.01)
-    # minimum real stride: |y offset| must exceed min_y_shift to count
-    real_shift = (torch.abs(foot_y_body) > min_y_shift).float()
-    reward = torch.sum(airborne * real_shift * lateral_match, dim=1)
-    return lateral_gate * reward
+    lateral_gate = torch.sigmoid((torch.abs(cmd[:, 1]) - lift_threshold) / 0.05)
+    return lateral_gate * lateral_gain * lift
 
 
 def standing_drift_l2(

@@ -63,14 +63,9 @@ D1H_CFG = ArticulationCfg(
             joint_names_expr=[".*_foot_joint"],
             effort_limit_sim=12.0,
             velocity_limit_sim=50.0,
-            # P torque control, matching ddt_rl_isaacgym: stiffness 10 N·m/rad,
-            # damping 0.5 N·m·s/rad. The policy outputs a wheel position target
-            # (JointPositionActionCfg); torque = 10*(q_target-q) - 0.5*w. This is the
-            # mature wheel-legged control that lets the wheels balance passively via
-            # damping while the policy supplies drive — replacing the velocity mode
-            # (stiffness 0) that fought balance and capped tracking at err_x~0.48.
-            stiffness=10.0,
-            damping=0.5,
+            # VELOCITY control (flat_19 config): stiffness=0, damping=1.0.
+            stiffness=0.0,
+            damping=1.0,
             friction=0.02,
         ),
     },

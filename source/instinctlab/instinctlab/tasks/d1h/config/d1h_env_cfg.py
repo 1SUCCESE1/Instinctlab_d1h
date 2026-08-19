@@ -118,16 +118,15 @@ class D1HActionsCfg:
         preserve_order=True,
     )
 
-    # left foot wheel: P torque control (matches ddt_rl_isaacgym).
-    # Policy outputs a wheel POSITION target; actuator torque = 10*(q_tgt-q) - 0.5*w.
-    # scale 0.5: action ±1 -> ±0.5 rad wheel target. Wheel speed emerges from the
-    # stiffness drive + damping, so the policy supplies drive and the damping
-    # passively balances — replacing the velocity mode that fought balance.
-    fl_foot_vel = mdp.JointPositionActionCfg(
+    # left foot wheel: VELOCITY control — flat_19 (150447) config, the only version
+    # that trained well under PPO (err_x 0.5, could stand and track). Velocity mode
+    # gives the policy a direct speed target, which is what PPO can learn (unlike
+    # pure torque control, which PPO could not learn to balance with).
+    fl_foot_vel = mdp.JointVelocityActionCfg(
         asset_name="robot",
         joint_names=["FL_foot_joint"],
-        scale=0.5,
-        clip={".*": (-3.0, 3.0)},
+        scale=5.0,
+        clip={".*": (-100.0, 100.0)},
         use_default_offset=True,
         preserve_order=True,
     )
@@ -146,12 +145,12 @@ class D1HActionsCfg:
         preserve_order=True,
     )
 
-    # right foot wheel: P torque control — see FL_foot_vel comment.
-    fr_foot_vel = mdp.JointPositionActionCfg(
+    # right foot wheel: VELOCITY control — see FL_foot_vel comment.
+    fr_foot_vel = mdp.JointVelocityActionCfg(
         asset_name="robot",
         joint_names=["FR_foot_joint"],
-        scale=0.5,
-        clip={".*": (-3.0, 3.0)},
+        scale=5.0,
+        clip={".*": (-100.0, 100.0)},
         use_default_offset=True,
         preserve_order=True,
     )
@@ -386,29 +385,27 @@ class RewardsCfg:
     is_terminated = RewTerm(func=mdp.is_terminated, weight=0.0)
 
     # -- task tracking. x uses split forward/backward kernels: deploy feedback says
-    # reverse tracks worse than forward. std_fwd 0.5 (as before) / std_bwd 0.3 (tighter)
-    # so reverse gets a sharper gradient and learns as precisely as forward.
+    # flat_19 value: weight 8.0, simple track_lin_vel_x_exp with std sqrt(0.25)
     track_lin_vel_x_exp = RewTerm(
-        func=mdp.track_lin_vel_x_split_exp,
+        func=mdp.track_lin_vel_x_exp,
         weight=8.0,
-        params={"command_name": "base_velocity", "std_fwd": math.sqrt(0.25), "std_bwd": 0.3},
+        params={"command_name": "base_velocity", "std": 0.5},
     )
     track_lin_vel_y_lateral_exp = RewTerm(
         func=mdp.track_lin_vel_y_lateral_exp,
         weight=12.0,
         params={
             "command_name": "base_velocity",
-            "std": math.sqrt(0.25),
+            "std": 0.5,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_foot"]),
         },
     )
     track_ang_vel_z_exp = RewTerm(
-        func=mdp.track_ang_vel_z_exp, weight=4.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+        func=mdp.track_ang_vel_z_exp, weight=4.0, params={"command_name": "base_velocity", "std": 0.5}
     )
 
-    # -- velocity smoothness: penalise jerky base velocity (deploy: speed tracking
-    # discontinuous). exp(-|dv|/0.5), so a speed step costs real reward.
-    vel_smoothness = RewTerm(func=mdp.vel_smoothness, weight=0.5)
+    # NOTE: wheel_torque_balance and vel_smoothness removed — not present in the
+    # flat_19 (150447) config. flat_19 is the version that trained well under PPO.
 
     # NOTE: lateral_lift_time (air-time reward) removed — it rewarded "time lifted"
     # which conflicts with y-velocity tracking (an airborne foot produces no y
@@ -429,6 +426,11 @@ class RewardsCfg:
     # the one that both learned to walk and kept shake controllable (roll 0.66); -2.0
     # is a mild tightening of the dominant shake axis without jumping to the -2.5
     # that (with tracking 15) froze walking.
+    # NO lateral gate. Run 20260813_211857 gated roll on the lateral command
+    # (release 0.5) and the policy could not stand (upward 2.6 vs 3.75 in flat_19):
+    # early training spends most time under lateral commands, so the released roll
+    # damping lets the robot fall. Keep full roll penalty always — strafe roll is
+    # handled by the roll VELOCITY being a dynamic (not static lean) quantity.
     ang_vel_x_l2 = RewTerm(func=mdp.ang_vel_x_l2, weight=-2.0)
     # pitch 角速度惩罚 -0.05 -> -0.2: 压住pitch来回摆(部署端反馈)。控制架构里
     # pitch平衡由轮子承担, 躯干自身不应高频摆动。
@@ -443,9 +445,9 @@ class RewardsCfg:
     # pitch rate: suppress torso pitch oscillation (-0.05 -> -0.3, 部署端pitch来回摆)
     pitch_rate_l2 = RewTerm(
         func=mdp.pitch_rate_l2,
+        # 150447 baseline: -0.3 (回退, -0.5压住pitch反而让轮子补偿更剧烈)
         weight=-0.3,
     )
-    # pitch-command coupling: no leaning into acceleration
     pitch_command_alignment = RewTerm(
         func=mdp.pitch_command_alignment,
         weight=-4.0,
@@ -458,7 +460,6 @@ class RewardsCfg:
         func=mdp.base_height_l2,
         weight=-5.0,
         params={
-            # target 0.35: physically reachable and matches the tracking height gate.
             "target_height": 0.35,
         },
     )
@@ -471,8 +472,7 @@ class RewardsCfg:
     )
     joint_vel_l2 = RewTerm(
         func=mdp.joint_vel_l2,
-        # -0.02 -> -0.01: 更放松腿, 允许明确的低频位置调整动作。高频抑制由
-        # leg_activity的vel_penalty_gain承担, 不再叠加此惩罚。
+        # flat_19 value: -0.01
         weight=-0.01,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"])},
     )
@@ -524,8 +524,9 @@ class RewardsCfg:
 
     joint_pos_penalty = RewTerm(
         func=mdp.joint_pos_penalty,
-        # -0.3 -> -0.6: 腿位置控制更精准(部署端速度不连续源于腿位置不精准)
-        weight=-0.6,
+        # -0.6 -> -0.3: -0.6 锁死了腿(部署端轮子剧烈前后滚平衡->pitch晃)。
+        # 回退让腿能低频微调平衡, 腿位置准确性由 body_pos_to_feet_x/leg_activity 保证。
+        weight=-0.3,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"]),
@@ -568,7 +569,10 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"])},
     )
 
-    # 腾空时间奖励
+    # 腾空时间奖励。DDT_Lab-dev 原版 weight=2.0, min_air_t=0.5。
+    # 但轮足侧走是快速小步抬脚(~0.2s), 0.5s门槛太高导致奖励恒0。
+    # 降min_air_t到0.1匹配轮足抬脚时间; 权重对齐DDT 2.0。
+    # flat_19 value: disabled (weight 0)
     feet_air_time = RewTerm(
         func=mdp.reward_feet_air_time,
         weight=0.0,
@@ -592,12 +596,11 @@ class RewardsCfg:
     # base_height now enforces the standing height)
     body_pos_to_feet_x = RewTerm(
         func=mdp.reward_body_pos_to_feet_x,
-        # 3.0 权重保持。sigma 0.05(5cm) -> 0.015(1.5cm): 脚必须精确贴近重心投影
-        # (±1.5cm内), 提升腿位置精准度以改善速度跟踪连续性
-        weight=3.0,
+        # flat_19 value: weight 2.0, sigma 0.05
+        weight=2.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "sigma": 0.015,
+            "sigma": 0.05,
         },
     )
 
@@ -627,13 +630,12 @@ class RewardsCfg:
     # 需要腿张开), 站立/前进/后退时强制40cm。
     body_feet_distance_y = RewTerm(
         func=mdp.reward_body_feet_distance_y,
-        weight=-2.0,
+        # 150447 baseline: -0.8 (回退, -2.0约束太强)。腿距保留30cm
+        weight=-0.8,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "sigma": 0.1,
             "desired_feet_distance": 0.4,
-            "command_name": "base_velocity",
-            "lateral_threshold": 0.15,
         },
     )
 
@@ -663,34 +665,28 @@ class RewardsCfg:
     # 2.0 -> 1.5: 用户要求不再提高, 位置精准度靠joint_pos_pen/body_pos_to_feet加强。
     leg_activity = RewTerm(
         func=mdp.leg_activity,
-        weight=1.5,
+        # flat_19 value: 2.0
+        weight=2.0,
         params={
             "command_name": "base_velocity",
             "command_threshold": 0.1,
             "asset_cfg": SceneEntityCfg("robot"),
             "lean_gain": 0.07,
-            # vel_penalty_gain removed: it penalised ALL leg motion including the
-            # low-freq micro-adjustments needed for static balance, which made the
-            # robot wobble fore/aft when standing (deploy regression vs flat_19).
-            # Function default is 0.0 so no velocity penalty is applied.
+            "vel_penalty_gain": 0.003,
         },
     )
 
     # lateral stepping: reward genuine sideways foot DISPLACEMENT (y-shift driven).
-    # This is the correct lever for stride width — it rewards the foot's y-offset
-    # matching the command (lateral_gain*cmd_y) on an airborne foot. 1.5 -> 3.0 to
-    # make a real y-step the main lateral incentive (was too weak vs track_y 12).
+    # flat_19 value: 1.5, disabled — constant bias provides no learning gradient
     lateral_leg_lift = RewTerm(
         func=mdp.lateral_leg_lift,
-        weight=3.0,
+        weight=1.5,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_foot"]),
             "lift_threshold": 0.1,
             "lift_height": 0.02,
             "lateral_gain": 0.5,
-            # 脚必须横移超过3cm才算真步幅, 防止象征性抬脚骗奖励
-            "min_y_shift": 0.03,
         },
     )
 
@@ -710,6 +706,7 @@ class RewardsCfg:
     # zero-drift: penalize base velocity when command is ~zero
     standing_drift_l2 = RewTerm(
         func=mdp.standing_drift_l2,
+        # flat_19 value: -5.0
         weight=-5.0,
         params={
             "command_name": "base_velocity",
@@ -728,9 +725,8 @@ class RewardsCfg:
     # 需要能快速加减速。放松加速度惩罚让轮子响应更快(平衡优先于平滑)。
     wheel_acc_l2 = RewTerm(
         func=mdp.wheel_acc_l2,
-        # -1e-7 -> -5e-7: 压轮子高频震荡(实测raw 4.38e5, 轮子在超速/减速间大幅波动)。
-        # 不是回到-1e-4(那曾压垮追踪), -5e-7是中间值压住震荡仍允许追踪。
-        weight=-5e-7,
+        # 150447 baseline: -1e-7 (回退, -3e-7压住轮子反而加剧前后晃动)
+        weight=-1e-7,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_ids=[3, 7]),
         },
