@@ -391,9 +391,12 @@ class RewardsCfg:
         weight=8.0,
         params={"command_name": "base_velocity", "std": 0.5},
     )
+    # y 速度跟踪关闭: lin_vel_y 命令恒为 0, 从不出现真正的侧走。该奖励只是惩罚侧向
+    # 漂移, 且部署端 165234 站立晃动严重。连同 lateral_lift_time/lateral_leg_lift 一起
+    # 移除所有 y 轴奖励, 让站立/走行不承载侧向激励。
     track_lin_vel_y_lateral_exp = RewTerm(
         func=mdp.track_lin_vel_y_lateral_exp,
-        weight=12.0,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "std": 0.5,
@@ -404,8 +407,9 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=4.0, params={"command_name": "base_velocity", "std": 0.5}
     )
 
-    # NOTE: wheel_torque_balance and vel_smoothness removed — not present in the
-    # flat_19 (150447) config. flat_19 is the version that trained well under PPO.
+    # velocity smoothness: penalise jerky base velocity (deploy feedback: speed
+    # tracking discontinuous). exp(-|dv|/0.5), so a speed step costs real reward.
+    vel_smoothness = RewTerm(func=mdp.vel_smoothness, weight=0.8)
 
     # NOTE: lateral_lift_time (air-time reward) removed — it rewarded "time lifted"
     # which conflicts with y-velocity tracking (an airborne foot produces no y
@@ -432,9 +436,10 @@ class RewardsCfg:
     # damping lets the robot fall. Keep full roll penalty always — strafe roll is
     # handled by the roll VELOCITY being a dynamic (not static lean) quantity.
     ang_vel_x_l2 = RewTerm(func=mdp.ang_vel_x_l2, weight=-2.0)
-    # pitch 角速度惩罚 -0.05 -> -0.2: 压住pitch来回摆(部署端反馈)。控制架构里
-    # pitch平衡由轮子承担, 躯干自身不应高频摆动。
-    ang_vel_y_l2 = RewTerm(func=mdp.ang_vel_y_l2, weight=-0.2)
+    # pitch 角速度惩罚: 与 pitch_rate_l2 同源(都是 root_ang_vel_b[:,1]², 仅差一个
+    # upright 滤波), 二者叠加让 pitch 率惩罚难以单独调。关闭此条, 统一用
+    # pitch_rate_l2(无滤波, 对站立更直接)控制 pitch 阻尼。
+    ang_vel_y_l2 = RewTerm(func=mdp.ang_vel_y_l2, weight=0.0)
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-15.0)
     # trunk level: penalize pitch (bum raised) to keep the torso horizontal.
     # REQUIRED — without pitch_target the robot cannot stand up.
@@ -445,8 +450,21 @@ class RewardsCfg:
     # pitch rate: suppress torso pitch oscillation (-0.05 -> -0.3, 部署端pitch来回摆)
     pitch_rate_l2 = RewTerm(
         func=mdp.pitch_rate_l2,
-        # 150447 baseline: -0.3 (回退, -0.5压住pitch反而让轮子补偿更剧烈)
-        weight=-0.3,
+        # -1.0 回退到 -0.7: 133242 部署端轮子前后调整幅度很大、晃动明显。压 pitch 速度
+        # 过狠 -> 策略必须更凶地改轮速去抵消 pitch -> 轮子补偿更剧烈(注释里记过的坑)。
+        # -0.7 是 105526 部署「好多了」的值。
+        weight=-0.7,
+    )
+    # 直接奖励轮子输出重力平衡扭矩: tau_wheel ≈ m·g·(com_x - wheel_x)。轮足倒立摆
+    # 的正确平衡原理——CoM 一偏, 轮子就滚过去接住重心。当前配置里 pitch 平衡全靠
+    # pitch_target/pitch_rate/速度跟踪这些间接信号逼出来, 策略只能抖出平衡点
+    # (部署端前后晃)。此条给轮子一个清晰的"接重心"梯度。
+    # 必须用 exp 软形式 + 小权重(见 rewards.wheel_torque_balance docstring:
+    # run 170753 用线性惩罚 weight 3.0 把预算打爆、站立崩了)。
+    wheel_torque_balance = RewTerm(
+        func=mdp.wheel_torque_balance,
+        weight=0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_foot_joint"])},
     )
     pitch_command_alignment = RewTerm(
         func=mdp.pitch_command_alignment,
@@ -458,9 +476,12 @@ class RewardsCfg:
     )
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
+        # -10 回退到 -5: 133242 部署端高度很低、晃动明显。-10 把高度钉 0.40 太狠, 配合
+        # 僵硬 pitch 控制让腿/轮子不停纠正。斜坡门 + default_joint 本来就锚在 0.40,
+        # -5 足够。105526 部署「好多了」就是 -5(只是那版被 sigmoid 门拉高到 0.52)。
         weight=-5.0,
         params={
-            "target_height": 0.35,
+            "target_height": 0.40,
         },
     )
 
@@ -513,7 +534,7 @@ class RewardsCfg:
             # where both legs should move together; fully off while strafing (y),
             # which needs the asymmetric alternating gait.
             "command_name": "base_velocity",
-            "lateral_release": 0.0,
+            "lateral_release": 0.5,
             "mirror_joints": [
                 ["FL_hip_joint", "FR_hip_joint"],
                 ["FL_thigh_joint", "FR_thigh_joint"],
@@ -526,11 +547,11 @@ class RewardsCfg:
         func=mdp.joint_pos_penalty,
         # -0.6 -> -0.3: -0.6 锁死了腿(部署端轮子剧烈前后滚平衡->pitch晃)。
         # 回退让腿能低频微调平衡, 腿位置准确性由 body_pos_to_feet_x/leg_activity 保证。
-        weight=-0.3,
+        weight=-0.2,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"]),
-            "stand_still_scale": 1,
+            "stand_still_scale": 1.5,
             "velocity_threshold": 0.02,
             "command_threshold": 0.02,
         },
@@ -562,10 +583,10 @@ class RewardsCfg:
     # Strong default-pose anchoring (131545 value) combined with leg_activity=2.0:
     # legs stay near default (stable) but are actively driven to move when needed.
     default_joint_l2 = RewTerm(
-        # -1.0 -> -0.5: 默认位是「参考姿态」不是「锁定」。再放松一档, 让腿能
-        # 更自由地大幅离开默认位去定位轮子(部署端腿太死, 靠pitch调姿态)。
+        # 部署端反馈: 前进时腿频繁调整。加强默认位锚定, 让腿稳定在参考姿态附近。
+        # -0.3 -> -0.6(仍弱于 -1.0 的"锁死", 保留一定自由度)。
         func=mdp.default_joint_l2,
-        weight=-0.5,
+        weight=-0.3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"])},
     )
 
@@ -609,7 +630,9 @@ class RewardsCfg:
     # 部署端表现为左右脚不对称。-1.0 强制两腿 x 同步。
     body_feet_distance_x = RewTerm(
         func=mdp.reward_body_feet_distance_x,
-        weight=-1.0,
+        # 部署端反馈: 两腿前后错开(一前一后)。-3.0 -> -1.5 回退到 222130 能跑的值:
+        # 翻倍版本是 232046 崩塌批次的一部分, 与趴地局部最优叠加后帮倒忙。
+        weight=-1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "sigma": 0.1,
@@ -620,7 +643,9 @@ class RewardsCfg:
     # 交替时两脚机体x速度相反, 速度差大; 位置惩罚抓不住(位置差随时间平均掉)。
     body_feet_vel_x = RewTerm(
         func=mdp.body_feet_vel_x,
-        weight=-0.5,
+        # 部署端反馈: 腿交替前后摆(两脚 x 速度相反)。-1.5 -> -0.7 回退到 222130 能跑的值,
+        # 与 body_feet_distance_x 同一崩塌批次。
+        weight=-0.7,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
         },
@@ -630,12 +655,14 @@ class RewardsCfg:
     # 需要腿张开), 站立/前进/后退时强制40cm。
     body_feet_distance_y = RewTerm(
         func=mdp.reward_body_feet_distance_y,
-        # 150447 baseline: -0.8 (回退, -2.0约束太强)。腿距保留30cm
+        # 150447 baseline: -0.8 (回退, -2.0约束太强)
         weight=-0.8,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "sigma": 0.1,
             "desired_feet_distance": 0.4,
+            "command_name": "base_velocity",
+            "lateral_threshold": 0.05,
         },
     )
 
@@ -643,7 +670,7 @@ class RewardsCfg:
     # 注意 weight=1.0 曾导致只学右侧走, 故取 0.8 平衡)
     body_symmetry_y = RewTerm(
         func=mdp.reward_body_symmetry_y,
-        weight=0.8,
+        weight=1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "sigma": 0.1,
@@ -662,25 +689,39 @@ class RewardsCfg:
 
     # forward/backward leg swing for balance (COM offset drive, wheels balance)
     # 架构:「腿低频把轮子摆到位 + 轮子高频保pitch + 轮速辅助」。
-    # 2.0 -> 1.5: 用户要求不再提高, 位置精准度靠joint_pos_pen/body_pos_to_feet加强。
     leg_activity = RewTerm(
         func=mdp.leg_activity,
-        # flat_19 value: 2.0
-        weight=2.0,
+        # 部署端反馈(2700轮导出): 前进时腿一前一后频繁调整。但上一轮把权重压到 0.5
+        # + vel_penalty 0.05 后, 整个项变成净负值(实测 leg_activity≈-0.07), 前进驱动
+        # 没了, 机器人学会"站着不动"(track_x 全程 0.01)。回退到 weight 1.5 + vel_penalty
+        # 0.02: 保留低频前进驱动, 同时用适度腿速惩罚抑制高频"频繁调整"。
+        weight=1.5,
         params={
             "command_name": "base_velocity",
             "command_threshold": 0.1,
             "asset_cfg": SceneEntityCfg("robot"),
             "lean_gain": 0.07,
-            "vel_penalty_gain": 0.003,
+            "vel_penalty_gain": 0.02,
         },
     )
 
-    # lateral stepping: reward genuine sideways foot DISPLACEMENT (y-shift driven).
-    # flat_19 value: 1.5, disabled — constant bias provides no learning gradient
+    # 侧走腾空奖励关闭: lin_vel_y 命令恒为 0, 侧走从不出现。该奖励在站立时仍有
+    # ~5% 漏奖励, 与 165234 部署端站立晃动相关。连同 y 速度跟踪一起移除。
+    lateral_lift_time = RewTerm(
+        func=mdp.lateral_lift_time,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_foot"]),
+            "lift_threshold": 0.15,
+            "max_lift_time": 0.5,
+        },
+    )
+
+    # 侧走抬脚奖励关闭: 同上。站立时 gate≈0.12 仍漏抬脚奖励, 会鼓励站立时抬脚/抖腿。
     lateral_leg_lift = RewTerm(
         func=mdp.lateral_leg_lift,
-        weight=1.5,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_foot"]),
@@ -718,7 +759,18 @@ class RewardsCfg:
     # limb/torso jitter suppression (softened from -0.08 to -0.05)
     action_rate_l2 = RewTerm(
         func=mdp.action_rate_l2,
-        weight=-0.05,
+        weight=-0.02,
+    )
+
+    # 轮子命令平滑: 105526 部署反馈原地轻微晃动 = 策略来回改轮速命令的 pitch 限环。
+    # 罚轮子动作命令本身的变化(不是实测加速度), 让轮速命令平滑, 躯干 pitch 就稳。
+    # wheel_acc_l2 罚的是实测轮子加速度(含平衡必需的响应), 与这里互补。
+    wheel_action_rate = RewTerm(
+        func=mdp.wheel_action_rate,
+        weight=-0.3,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_ids=[3, 7]),
+        },
     )
 
     # wheel acceleration penalty. -1e-6 -> -1e-7: 控制架构里轮子承担高频pitch平衡,
@@ -743,6 +795,13 @@ class TerminationsCfg:
         func=mdp.terrain_out_of_bounds,
         params={"asset_cfg": SceneEntityCfg("robot"), "distance_buffer": 3.0},
         time_out=True,
+    )
+    # 趴地终止: 020020 只有 time_out/出界, 机器人趴在地上也能混满 20 秒(净奖励还是正的),
+    # 躺着完全不扣分 -> 学不会站立。base z < 0.25m 持续 >= 100 步(~1s) 才终止,
+    # 平衡恢复中的瞬时下探不会刷重置, 蹲坐趴地才会。
+    collapsed_to_ground = DoneTerm(
+        func=mdp.collapsed_to_ground,
+        params={"asset_cfg": SceneEntityCfg("robot"), "height_threshold": 0.25, "sustain_steps": 100},
     )
 
 

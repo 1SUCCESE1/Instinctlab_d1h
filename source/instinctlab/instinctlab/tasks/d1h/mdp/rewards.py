@@ -18,16 +18,44 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def _base_height_sigma(env: ManagerBasedRLEnv, target_height: float = 0.35) -> torch.Tensor:
-    """Height gate that scales a reward by how tall the robot is.
+def _base_height_sigma(env: ManagerBasedRLEnv, target_height: float = 0.40) -> torch.Tensor:
+    """Height gate that scales a tracking reward by how tall the robot is.
 
-    Uses a sharp sigmoid around ``target_height`` (0.35 m): rewards stay ~1 when
-    standing at/above 0.35 m and vanish quickly below it, forcing the policy to
-    keep the frame up to earn the (tracking) reward.
+    Saturates at 1.0 for z >= target_height (0.40 m) and ramps to 0 below it, so it
+    only withholds tracking reward from a crouched robot. A sigmoid here would keep
+    growing with height above 0.40 and quietly reward standing taller than target —
+    run 20260821_105526 deployed at ~0.52 m, the sigmoid gate's pull-up (0.5 at 0.40
+    vs 0.77 at 0.52) overpowering base_height_l2. The ramp is flat for everything at
+    or above target, leaving base_height_l2 as the sole height force.
     """
     asset: RigidObject = env.scene["robot"]
     z = asset.data.root_pos_w[:, 2]
-    return torch.sigmoid((z - target_height) / 0.02)
+    return torch.clamp((z - (target_height - 0.12)) / 0.12, 0.0, 1.0)
+
+
+def collapsed_to_ground(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    height_threshold: float = 0.25,
+    sustain_steps: int = 100,
+) -> torch.Tensor:
+    """Terminate when the base stays collapsed below ``height_threshold`` too long.
+
+    Run 20260821_020020: with only time_out / terrain_out_of_bounds terminations a
+    collapsed robot idles on the ground for the full 20 s episode collecting a
+    comfortable net-positive reward (upward +3.78 dominates), so lying down costs
+    nothing at the episode level. Fires when the base has been below
+    ``height_threshold`` (well under the 0.40 target and the ~0.47 natural standing
+    height) for ``sustain_steps`` steps (~1 s): transient dips during balance
+    recovery do not spam resets, but a settled squat does.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    low = asset.data.root_pos_w[:, 2] < height_threshold
+    if not hasattr(env, "_collapse_steps"):
+        env._collapse_steps = torch.zeros_like(low, dtype=torch.float)
+    env._collapse_steps[low] += 1.0
+    env._collapse_steps[~low] = 0.0
+    return env._collapse_steps >= sustain_steps
 
 
 def track_lin_vel_x_split_exp(
@@ -582,7 +610,9 @@ def wheel_torque_balance(
     # (upward 0.07, noise_std exploded to 6). exp keeps torque-matching as a soft
     # bonus that rewards improvement near the target without punishing the policy
     # into giving up when it cannot match exactly. Keep the weight small.
-    reward = torch.exp(-torch.abs(tau_wheel - tau_grav) / 2.0)
+    # sigma 2.0 -> 4.0: 2.0 太紧(相对 12Nm 轮子 effort limit), 奖励贴地(实测~0.03),
+    # 梯度太弱教不会轮子平衡。放宽到 4.0 让"接重心"信号可被挣到, 压住低频前后晃。
+    reward = torch.exp(-torch.abs(tau_wheel - tau_grav) / 4.0)
     reward *= torch.clamp(-asset.data.projected_gravity_b[:, 2].to(device), 0, 0.7) / 0.7
     return reward
 
@@ -735,7 +765,7 @@ def reward_body_feet_distance_y(
     if command_name is not None:
         cmd_y = env.command_manager.get_command(command_name)[:, 1]
         # 1 while a lateral command is active -> penalty off; 0 otherwise
-        y_gate = torch.sigmoid((torch.abs(cmd_y) - lateral_threshold) / 0.02)
+        y_gate = torch.sigmoid((torch.abs(cmd_y) - lateral_threshold) / 0.05)
         reward = reward * (1.0 - y_gate)
     return reward
 
