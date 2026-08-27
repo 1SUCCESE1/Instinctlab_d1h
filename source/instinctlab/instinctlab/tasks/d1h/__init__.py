@@ -16,6 +16,17 @@ gym.register(
     },
 )
 
+# TPPO distillation task: uses DDT ONNX teacher (flat.onnx)
+gym.register(
+    id="Instinct-Locomotion-Flat-D1H-Distill-v0",
+    entry_point="instinctlab.envs:InstinctRlEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": d1h_flat_env_cfg.D1hFlatEnvCfg,
+        "instinct_rl_cfg_entry_point": f"{agents.__name__}.instinct_rl_tpppo_cfg:D1hTPPORunnerCfg",
+    },
+)
+
 gym.register(
     id="Instinct-Locomotion-Flat-D1H-Play-v0",
     entry_point="instinctlab.envs:InstinctRlEnv",

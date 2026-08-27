@@ -21,16 +21,17 @@ if TYPE_CHECKING:
 def _base_height_sigma(env: ManagerBasedRLEnv, target_height: float = 0.40) -> torch.Tensor:
     """Height gate that scales a tracking reward by how tall the robot is.
 
-    Saturates at 1.0 for z >= target_height (0.40 m) and ramps to 0 below it, so it
-    only withholds tracking reward from a crouched robot. A sigmoid here would keep
-    growing with height above 0.40 and quietly reward standing taller than target —
-    run 20260821_105526 deployed at ~0.52 m, the sigmoid gate's pull-up (0.5 at 0.40
-    vs 0.77 at 0.52) overpowering base_height_l2. The ramp is flat for everything at
-    or above target, leaving base_height_l2 as the sole height force.
+    Saturating ramp up to ``target_height`` (0.40 m): tracking reward ramps from 0 at
+    0.28 m to full at 0.40 m and stays 1.0 above. The bell (peak at 0.40) let the
+    deterministic policy sink to ~0.35 m because its upward pull below the target was
+    weak; the ramp makes crouching cost much more tracking reward, pushing the policy
+    up to 0.40, while being flat above stops the overshoot the sigmoid gate caused
+    (stood ~0.52 m).
     """
     asset: RigidObject = env.scene["robot"]
     z = asset.data.root_pos_w[:, 2]
-    return torch.clamp((z - (target_height - 0.12)) / 0.12, 0.0, 1.0)
+    gate = (z - 0.28) / (target_height - 0.28)
+    return torch.clamp(gate, 0.0, 1.0)
 
 
 def collapsed_to_ground(
