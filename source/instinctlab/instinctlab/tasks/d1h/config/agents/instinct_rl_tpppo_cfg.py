@@ -44,8 +44,10 @@ class D1hAlgorithmCfg(InstinctRlPpoAlgorithmCfg):
     # teacher_logdir, teacher_policy_class_name, teacher_policy, etc. are set
     # by train_distill.py (the teacher is OnnxTeacher, not a torch checkpoint)
     teacher_act_prob = "exp"          # schedule: decays from 1.0 to 0.0 over training
-    update_times_scale = 500          # teacher act prob decays to ~0 over 500 iterations
-    distillation_loss_coef = 1.0      # weight of distillation loss vs PPO loss
+    update_times_scale = 100          # teacher influence fades over ~100 iters (was 500, too long)
+    distillation_loss_coef = 0.1      # 10% distillation weight (was 1.0, too strong — student
+                                      # forced to imitate teacher's DDT behaviour instead of
+                                      # learning the current reward signal)
     distill_target = "mse_sum"        # MSE sum over action dims
     label_action_with_critic_obs = False   # use actor obs, not critic obs for teacher labels
     action_labels_from_sample = False
