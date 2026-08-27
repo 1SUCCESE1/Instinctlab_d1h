@@ -150,6 +150,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: InstinctRlOn
     teacher = OnnxTeacher(args_cli.teacher_onnx, obs_dim=33, history_len=10)
     teacher.init_history(env.num_envs)
     runner.alg.teacher_actor_critic = teacher
+    runner.alg.teacher_policy_normalizer = None  # no normalizer needed for OnnxTeacher
     runner.alg.label_action_with_critic_obs = False
     print(f"[INFO] Teacher loaded from: {args_cli.teacher_onnx}")
     print(f"[INFO] Teacher act_prob schedule: exp decay, scale={runner.alg.update_times_scale}")
