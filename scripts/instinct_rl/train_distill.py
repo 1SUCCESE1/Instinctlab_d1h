@@ -124,6 +124,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: InstinctRlOn
         env = multi_agent_to_single_agent(env)
     env = InstinctRlVecEnvWrapper(env)
 
+    # inject teacher_policy obs_format into TPPO config (TPPO.__init__ needs it to build a dummy teacher)
+    agent_cfg.algorithm.teacher_policy = {
+        "obs_format": {
+            "policy": {
+                "base_ang_vel": (3,), "projected_gravity": (3,), "velocity_commands": (3,),
+                "joint_pos": (8,), "joint_vel": (8,), "actions": (8,),
+            },
+            "critic": {
+                "base_lin_vel": (3,), "base_ang_vel": (3,), "projected_gravity": (3,),
+                "velocity_commands": (3,), "joint_pos": (8,), "joint_vel": (8,), "actions": (8,),
+            },
+        },
+        "num_actions": 8,
+        "num_rewards": 1,
+        "class_name": "ActorCritic",
+    }
+    agent_cfg.algorithm.teacher_logdir = None  # replaced by OnnxTeacher below
+
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     runner.add_git_repo_to_log(__file__)
 
